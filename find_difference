@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#for i in {1..22}
+#do
+i=$1
+awk '{print$1}' gtex_hippo_chr$i\_genotype.txt >> impute.snp_chr$i
+awk '{print$1}' Brain_Hippocampus_genotype_unimpute.chr$i.txt >> unimpute.snp_chr$i
+
+#找出a中没有 b中有的行
+awk 'NR==FNR{a[$0]=1}NR>FNR{if(a[$0]!=1)print}' impute.snp_chr$i unimpute.snp_chr$i >> difference_chr$i
+
+for snp in `cat difference_chr$i`
+    do 
+    grep -w $snp Brain_Hippocampus_genotype_unimpute.chr$i.txt >> difference_chr$i\snp
+done
+
+cat gtex_hippo_chr$i\_genotype.txt difference_chr$i\snp >> gtex_hippo_chr$i\_all_genotype.txt 
+sed -i 's/NA/1/g' gtex_hippo_chr$i\_all_genotype.txt
+#done
