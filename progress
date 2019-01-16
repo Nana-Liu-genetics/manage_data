@@ -1,0 +1,177 @@
+#!/bin/bash
+#原始数据处理
+#这个文件夹中有：压缩的表达文件、解压的表达文件、去掉前三列的表达文件、回归掉协变量的表达、协变量
+
+expression_folder=/g/nana/twas/raw_data/expression/
+genotype_folder=/g/nana/twas/raw_data/Brain_Genotypes_raw_data/
+genotype_qc_folder=/g/nana/twas/raw_data/vcf_qc/
+finemapping_folder=/g/nana/twas/finemapping/
+
+#1.表达文件：原始的表达前4行是 chr start  end  gene_id，做finemapping的时候就用这个原始文件，做TWAS的时候需要去掉前三列
+#1.1 TWAS准备：去掉前3列
+echo 'Whole_Blood' >> tissue.txt
+echo 'Brain_Hippocampus' >> tissue.txt
+echo 'Brain_Amygdala' >> tissue.txt
+echo 'Brain_Anterior_cingulate_cortex_BA24' >> tissue.txt
+echo 'Brain_Caudate_basal_ganglia' >> tissue.txt
+echo 'Brain_Cerebellar_Hemisphere' >> tissue.txt
+echo 'Brain_Cerebellum' >> tissue.txt
+echo 'Brain_Cortex' >> tissue.txt
+echo 'Brain_Frontal_Cortex_BA9' >> tissue.txt
+echo 'Brain_Hypothalamus' >> tissue.txt
+echo 'Brain_Nucleus_accumbens_basal_ganglia' >> tissue.txt
+echo 'Brain_Putamen_basal_ganglia' >> tissue.txt
+echo 'Brain_Substantia_nigra' >> tissue.txt
+
+for j in `cat tissue.txt`
+    do echo $j
+    awk '{for(i=4;i<NF;i++)printf("%s\t ",$i);print $NF}' ${expression_folder}$j.v7.normalized_expression.bed > ${expression_folder}$j.expression.txt
+#1.2 做finemapping的时候需要有tabix文件（下面这些文件已经生成）压缩以及 tabix
+bgzip ${expression_folder}$j.v7.normalized_expression.bed
+tabix ${expression_folder}$j.v7.normalized_expression.bed.gz
+bgzip ${expression_folder}$j.v7.covariates.txt
+tabix ${expression_folder}$j.v7.covariates.txt.gz
+
+#还应该只保留protein coding gene
+
+done
+#2基因型文件质控
+#可以写一个外部的提交文件，多个并行：for j in `cat tissue.txt`,do,nohup bash qc1.sh $j &,done
+for i in `cat tissue.txt`
+#1.保留filter是pass的位点
+/g/nana/tools/vcftools/bin/vcftools --gzvcf ${genotype_folder}$i.vcf.gz --remove-filtered-all --recode --stdout | gzip -c > ${genotype_qc_folder}$i.output_PASS_only.vcf.gz
+#2.去除indel
+/g/nana/tools/vcftools/bin/vcftools --gzvcf ${genotype_qc_folder}$i.output_PASS_only.vcf.gz --remove-indels --recode --recode-INFO-all --out ${genotype_qc_folder}$i.SNPs_only
+#3.snp水平的质控 maf0.01，hwe0.01 ，geno0.85
+/g/nana/tools/vcftools/bin/vcftools --vcf ${genotype_qc_folder}$i.SNPs_only.recode.vcf --maf 0.01 --hwe 1e-6 --max-missing 0.85 --recode --out ${genotype_qc_folder}$i.qc.vcf
+#4.下面是跑finemapping的时候，需要做tabix文件
+bgzip ${genotype_qc_folder}$i.qc.vcf.recode.vcf
+tabix ${genotype_qc_folder}$i.qc.vcf.recode.vcf.gz
+mkdir /g/nana/weight_table/finemapping/$i
+done
+#上面的中间文件都可以删除
+
+#3.finemapping
+#3.1 找到egene以及上面独立的位点
+
+for tissue in `cat tissue.txt` 
+do  
+    #permutation10000次
+    sh runPerm.sh $tissue
+    #合并生成的文件
+    cat ${finemapping_folder}$tissue/permutations_*.txt | gzip -c > ${finemapping_folder}$tissue/permutations_all.txt.gz
+    #做FDR校正，0.05
+    Rscript /g/zhouyao/tools/QTLtools/script/runFDR_cis.R ${finemapping_folder}$tissue/permutations_all.txt.gz 0.05 ${finemapping_folder}$tissue/permutations_all
+    #条件分析
+    sh runCondi.sh $tissue
+    #合并conditional analysis的结果
+    cat ${finemapping_folder}$tissue/conditional_*.txt >> ${finemapping_folder}$tissue/conditional_pre.txt
+    #找到独立的信号
+    awk '{ if ($19 == 1) print $0}' ${finemapping_folder}$tissue/conditional_pre.txt  > ${finemapping_folder}$tissue/conditional_top_variants.txt
+done
+#下面两个是子脚本
+#子脚本1：做10000次的置换检验，得到每个基因eqtl的校正P值
+#-p可以指定线程数目
+tissue=$1
+for j in $(seq 1 128); do
+  echo "cis --vcf ${genotype_qc_folder}biobank_hippo.qc.vcf.recode.vcf.gz --bed ${expression_folder}$tissue.v7.normalized_expression.bed.gz --cov /g/nana/twas/raw_data/GTEx_Analysis_v7_eQTL_covariates/$tissue.v7.covariates.txt.gz  --permute 10000 --chunk $j 128 --out ${finemapping_folder}$tissue/permutations_$j\_128.txt";
+done | xargs -P50 -n14 /g/zhouyao/tools/QTLtools/QTLtools_1.1_Ubuntu16.04_x86_64  
+
+#子脚本2：按照上面得到的阈值筛选出egene，然后通过条件分析找到每个egene上独立的信号
+tissue=$1
+for j in $(seq 1 64);    
+do
+    echo "cis --vcf ${genotype_qc_folder}$tissue.qc.vcf.recode.vcf.gz --bed ${expression_folder}$tissue.v7.normalized_expression.bed.gz --cov /g/nana/twas/raw_data/GTEx_Analysis_v7_eQTL_covariates/$tissue.v7.covariates.txt.gz --mapping ${finemapping_folder}permutations_all.thresholds.txt --chunk $j 64 --out ${finemapping_folder}$tissue/conditional_$j\_64.txt" ;
+    done | xargs -P64 -n14 /g/zhouyao/tools/QTLtools/QTLtools_1.1_Ubuntu16.04_x86_64
+
+#3.2做finemapping，上面的做法就是在egene上做finamapping，我现在是直接做finamapping
+tissue=$1
+#做一个需要的eqtl list文件 Gene Chromosome Base_pair location_Reference_allele Alternate_allele tab-separated file with no header
+awk 'BEGIN{OFS="_"}{print$1,$2,$8}' ${finemapping_folder}$tissue/conditional_top_variants.txt >> ${finemapping_folder}$tissue/eqtl
+awk -F '_' 'BEGIN{OFS="\t"}{print $1,$2,$4,$5,$6}' ${finemapping_folder}$tissue/eqtl >> ${finemapping_folder}$tissue/eqtl.list
+#caveman可以做回归协变量，现在我相当于是每个基因都挑了一个位点，所以就只是回归协变量，不回归其他位点的影响，验证了一下，用单个基因在SPSS里面做，结果是一样的
+/g/zhouyao/tools/CaVEMaN/CaVEMaN --single-signal --eqtl eqtl.list --bed ${expression_folder}$tissue\.v7.normalized_expression.bed --vcf ${genotype_qc_folder}$tissue.qc.vcf.recode.vcf.gz --out ${expression_folder}$tissue\_corrected.expression.bed --cov /g/nana/twas/raw_data/expression/$tissue\.v7.covariates.txt --verbose
+
+#下面是finemapping的程序，
+mkdir ${finemapping_folder}$tissue/CaVEMaN
+mkdir ${finemapping_folder}$tissue/top
+genes_per_file=30
+n_rows=`cat ${expression_folder}$tissue\_corrected.expression.bed | wc -l `
+# echo $n_rows
+n_files=`expr $n_rows / $genes_per_file`
+n_files=`expr $n_files + 1`
+# echo $n_files
+for j in $(seq 0 $n_files)
+do
+    echo "--bed ${expression_folder}$tissue\_corrected.expression.bed\
+    --vcf ${genotype_qc_folder}$tissue.qc.vcf.recode.vcf.gz
+    --genes $genes_per_file \
+    --job-number $j \
+    --verbose\
+    --out ${finemapping_folder}$tissue/CaVEMaN/$tissue\_$j";
+done | xargs -P40 -n11 /g/zhouyao/tools/CaVEMaN/CaVEMaN
+
+#4.finemapping结果的整理
+#4.1提取top10 20 50 100 用的是python脚本
+python top_prob.py
+#下面是脚本的内容，python脚本里面的参数
+import pandas as pd
+import os
+
+dbs = os.listdir('/g/nana/twas/finemapping/Brain_Hippocampus/CaVEMaN')
+for db in dbs:
+    df = pd.read_csv(f'/g/nana/twas/finemapping/Brain_Hippocampus/CaVEMaN{db}',sep='\t',low_memory=False)
+    grouped = df.groupby('GENE')
+    for group_name,group in grouped:
+        sorted_group = group.sort_values(by = ['CaVEMaN'], ascending=False)
+        sorted_group.head(10).to_csv(f'/g/nana/twas/finemapping/Brain_Hippocampus/top/{db}_top10',sep = '\t',mode = 'a',index = False,header = None) 
+        sorted_group.head(20).to_csv(f'/g/nana/twas/finemapping/Brain_Hippocampus/top/{db}_top20',sep = '\t',mode = 'a',index = False,header = None)         
+        sorted_group.head(50).to_csv(f'/g/nana/twas/finemapping/Brain_Hippocampus/top/{db}_top50',sep = '\t',mode = 'a',index = False,header = None) 
+        sorted_group.head(100).to_csv(f'/g/nana/twas/finemapping/Brain_Hippocampus/top/{db}_top100',sep = '\t',mode = 'a',index = False,header = None) 
+#4.2 合并提取好的文件
+tissue=$1
+for j in $(seq 1 1000)
+do
+if test -f ${finemapping_folder}$tissue/top/Brain_Hippocampus_$j_top50
+then
+   cat ${finemapping_folder}$tissue/top/$tissue\_$j\_top100 >> ./$tissue/$tissue\_top100
+   cat ${finemapping_folder}$tissue/top/$tissue\_$j\_top50 >> ./$tissue/$tissue\_top50
+   cat ${finemapping_folder}$tissue/top/$tissue\_$j\_top20 >> ./$tissue/$tissue\_top20
+   cat ${finemapping_folder}$tissue/top/$tissue\_$j\_top10 >> ./$tissue/$tissue\_top10
+fi
+done 
+#4.3 提取genelist和snplist
+tissue=$1
+num=$2
+awk '{print $1}' ./$tissue/$tissue\_top$num >> ./$tissue/gene_$num
+awk -F '_' '{print $1}' ./$tissue/gene_$num >> ./$tissue/genes_$num
+sort -u ./$tissue/genes_$num >> ./$tissue/gene_list_$num
+#这个SNPlist做的不好  应该直接生成 不用merge
+awk '{print $2,$3,$4,$5}' ./$tissue/$tissue\_top$num >> ./$tissue/snp_$num
+sort -u ./$tissue/snp_$num >> ./$tissue/snps_list_$num
+rm ./$tissue/gene_$num
+rm ./$tissue/genes_$num
+rm ./$tissue/snp_$num
+
+#4.4 把基因文件按照染色体分开，然后再分开每个基因
+
+for i in {1..22}
+do
+  awk -v m=$i '{if($2==m)print$0}' Brain_Hippocampus_top50_protein >> step1_$i
+  awk '{print$1}' step1_$i >> step2_$i
+  sort -u step2_$i >> Brain_Hippocampus_genelist_chr$i
+  rm step1_$i
+  rm step2_$i
+
+  for j in `cat Brain_Hippocampus_genelist_chr$i`
+  do echo $j
+        grep -w $j /g/nana/weight_table/raw_data/Brain_expression_bed/Brain_Hippocampus.expression.txt >> Brain_Hippocampus_expression_$i
+  done
+
+  split -l 1 -d -a 4 Brain_Hippocampus_expression_$i Brain_Hippocampus_$i\_expression_
+
+done
+
+#4.5
+
+
