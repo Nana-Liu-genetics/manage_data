@@ -32,9 +32,13 @@ tabix ${expression_folder}$j.v7.normalized_expression.bed.gz
 bgzip ${expression_folder}$j.v7.covariates.txt
 tabix ${expression_folder}$j.v7.covariates.txt.gz
 
-#还应该只保留protein coding gene
-
+#1.3 只保留蛋白质编码基因
+for i in `cat protein_coding_gene_list`
+do echo $i
+awk -v m=$i '{if($4==m)print$0}' ${expression_folder}$j.v7.normalized_expression.bed >> ${expression_folder}$j.v7.normalized_expression_protein_coding.bed
 done
+done
+
 #2基因型文件质控
 #可以写一个外部的提交文件，多个并行：for j in `cat tissue.txt`,do,nohup bash qc1.sh $j &,done
 for i in `cat tissue.txt`
